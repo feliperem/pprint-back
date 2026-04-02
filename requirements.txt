@@ -3,3 +3,11 @@ uvicorn[standard]
 playwright==1.58.0
 pydantic-settings
 pydantic>=2.0
+redis
+pymongo
+motor
+aioredis
+python-dotenv
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
