@@ -29,6 +29,7 @@ class InitMessage(BaseModel):
     type: str = MessageType.INIT
     pixelsDisponiveis: int
     pixelsMax: int
+    secondsUntilNextPixel: int
     canvas: dict  # { "x,y": color, ... }
     onlineCount: int
     activeUsers: list
@@ -39,6 +40,8 @@ class DrawResponseMessage(BaseModel):
     type: str = MessageType.DRAW
     success: bool
     pixelsRemaining: int
+    pixelsMax: int
+    secondsUntilNextPixel: int
     x: Optional[int] = None
     y: Optional[int] = None
     error: Optional[str] = None
@@ -69,6 +72,8 @@ class DrawBatchResponseMessage(BaseModel):
     processed: int
     failed: int
     pixelsRemaining: int
+    pixelsMax: int
+    secondsUntilNextPixel: int
     error: str | None = None
 
 
@@ -76,7 +81,9 @@ class PixelsUpdateMessage(BaseModel):
     """Atualiza pixel disponível após recuperação"""
     type: str = MessageType.PIXELS_UPDATE
     pixelsDisponiveis: int
+    pixelsMax: int
     pixelsGained: int
+    secondsUntilNextPixel: int
     lastUpdated: Optional[str] = None
 
 

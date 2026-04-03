@@ -18,6 +18,19 @@ from app.services.mongo_service import mongo_service
 logger = logging.getLogger(__name__)
 
 
+async def get_user_pixel_config(user_id: str) -> dict:
+    """Carrega configuracao atual de pixels do usuario a partir do Mongo."""
+    return await mongo_service.get_or_create_user_pixel_config(user_id)
+
+
+def build_pixel_state(pixels_disponiveis: int, pixels_max: int, seconds_until_next_pixel: int) -> dict:
+    return {
+        "pixelsDisponiveis": pixels_disponiveis,
+        "pixelsMax": pixels_max,
+        "secondsUntilNextPixel": max(0, seconds_until_next_pixel),
+    }
+
+
 class ConnectionManager:
     def __init__(self):
         # user_id -> set of WebSockets
@@ -46,19 +59,25 @@ class ConnectionManager:
     async def disconnect(self, user_id: str, websocket: WebSocket, image_id: str):
         """Desconecta um cliente"""
         try:
+            removed_connection = False
+            removed_viewer = False
+
             if user_id in self.active_connections:
+                removed_connection = websocket in self.active_connections[user_id]
                 self.active_connections[user_id].discard(websocket)
                 
                 if not self.active_connections[user_id]:
                     del self.active_connections[user_id]
             
             if image_id in self.image_viewers:
+                removed_viewer = user_id in self.image_viewers[image_id]
                 self.image_viewers[image_id].discard(user_id)
                 
                 if not self.image_viewers[image_id]:
                     del self.image_viewers[image_id]
-            
-            logger.info(f"Client disconnected: {user_id} from image {image_id}")
+
+            if removed_connection or removed_viewer:
+                logger.info(f"Client disconnected: {user_id} from image {image_id}")
         except Exception as e:
             logger.error(f"Error disconnecting: {e}")
 
@@ -98,38 +117,60 @@ class ConnectionManager:
 connection_manager = ConnectionManager()
 
 
-async def recover_user_pixels(user_id: str, websocket: WebSocket, source: str = "periodic") -> None:
-    """Recupera pixels e notifica cliente, gravando log em Mongo."""
+async def recover_user_pixels(user_id: str, websocket: WebSocket, source: str = "periodic") -> dict:
+    """Recupera pixels e devolve estado atualizado do saldo do usuario."""
     try:
+        pixel_config = await get_user_pixel_config(user_id)
+        pixels_max = pixel_config["pixelsMax"]
         current_time = int(datetime.utcnow().timestamp())
-        new_pixels, pixels_gained = redis_service.recover_pixels(
+        new_pixels, pixels_gained, seconds_until_next_pixel = redis_service.recover_pixels(
             user_id=user_id,
-            pixels_max=settings.PIXELS_MAX,
+            pixels_max=pixels_max,
             current_time=current_time,
             recovery_interval=settings.PIXEL_RECOVERY_INTERVAL,
         )
+
+        pixel_state = build_pixel_state(new_pixels, pixels_max, seconds_until_next_pixel)
 
         if pixels_gained > 0:
             await mongo_service.log_countdown_recovery(user_id, pixels_gained, source)
 
             update_msg = {
                 "type": MessageType.PIXELS_UPDATE,
-                "pixelsDisponiveis": new_pixels,
+                **pixel_state,
                 "pixelsGained": pixels_gained,
                 "lastUpdated": datetime.utcnow().isoformat(),
             }
             await connection_manager.send_personal(websocket, update_msg)
 
+        return pixel_state
+
     except Exception as e:
         logger.error(f"Error recovering pixels for {user_id}: {e}")
+        pixel_config = await get_user_pixel_config(user_id)
+        return build_pixel_state(
+            redis_service.get_pixels(user_id),
+            pixel_config["pixelsMax"],
+            0,
+        )
 
 
-async def periodic_recovery_task(user_id: str, websocket: WebSocket):
-    """Task que dispara recuperação periódica enquanto o WS estiver conectado."""
+async def periodic_recovery_task(user_id: str, websocket: WebSocket, recovery_event: asyncio.Event):
+    """Task que agenda a recuperação com base no próximo pixel e acorda após novos envios."""
     try:
         while True:
-            await asyncio.sleep(settings.PIXEL_RECOVERY_INTERVAL)
-            await recover_user_pixels(user_id, websocket, source="periodic")
+            pixel_state = await recover_user_pixels(user_id, websocket, source="periodic")
+
+            if pixel_state["pixelsDisponiveis"] >= pixel_state["pixelsMax"]:
+                sleep_for = 5
+            else:
+                sleep_for = max(1, pixel_state["secondsUntilNextPixel"])
+
+            try:
+                await asyncio.wait_for(recovery_event.wait(), timeout=sleep_for)
+                recovery_event.clear()
+            except asyncio.TimeoutError:
+                continue
     except asyncio.CancelledError:
         logger.debug(f"Periodic recovery task canceled for {user_id}")
     except Exception as e:
@@ -142,20 +183,23 @@ async def handle_websocket_connection(websocket: WebSocket, user_id: str, image_
     """
     await connection_manager.connect(websocket, user_id, image_id)
     recovery_task = None
+    recovery_event = asyncio.Event()
 
     try:
+        pixel_config = await get_user_pixel_config(user_id)
+        pixels_max = pixel_config["pixelsMax"]
+
         # Inicializa o usuário se necessário
         current_time = int(datetime.utcnow().timestamp())
-        redis_service.init_user(user_id, settings.PIXELS_MAX, current_time)
+        redis_service.init_user(user_id, pixels_max, current_time)
 
         # Tenta recuperação imediata (caso esteja offline por tempo suficiente)
-        await recover_user_pixels(user_id, websocket, source="connection")
+        pixel_state = await recover_user_pixels(user_id, websocket, source="connection")
 
         # Inicia task periódica de recuperação
-        recovery_task = asyncio.create_task(periodic_recovery_task(user_id, websocket))
+        recovery_task = asyncio.create_task(periodic_recovery_task(user_id, websocket, recovery_event))
 
         # Obtém estado atual
-        pixels_disponveis = redis_service.get_pixels(user_id)
         canvas = redis_service.get_canvas(image_id)
         online_count = connection_manager.get_online_count(image_id)
         active_users = connection_manager.get_active_users(image_id)
@@ -163,15 +207,14 @@ async def handle_websocket_connection(websocket: WebSocket, user_id: str, image_
         # Envia inicialização
         init_msg = {
             "type": MessageType.INIT,
-            "pixelsDisponiveis": pixels_disponveis,
-            "pixelsMax": settings.PIXELS_MAX,
+            **pixel_state,
             "canvas": canvas,
             "onlineCount": online_count,
             "activeUsers": active_users
         }
         await connection_manager.send_personal(websocket, init_msg)
         
-        logger.info(f"Init sent to {user_id}: {pixels_disponveis}/{settings.PIXELS_MAX}")
+        logger.info(f"Init sent to {user_id}: {pixel_state['pixelsDisponiveis']}/{pixel_state['pixelsMax']}")
         
         # Loop de mensagens
         while True:
@@ -184,20 +227,22 @@ async def handle_websocket_connection(websocket: WebSocket, user_id: str, image_
                     websocket=websocket,
                     user_id=user_id,
                     image_id=image_id,
-                    message=data
+                    message=data,
+                    recovery_event=recovery_event,
                 )
             elif msg_type == MessageType.DRAW_BATCH or msg_type == "draw_batch":
                 await handle_draw_batch(
                     websocket=websocket,
                     user_id=user_id,
                     image_id=image_id,
-                    message=data
+                    message=data,
+                    recovery_event=recovery_event,
                 )
             else:
                 logger.debug(f"Unknown message type from {user_id}: {msg_type}")
 
     except WebSocketDisconnect:
-        await connection_manager.disconnect(user_id, websocket, image_id)
+        logger.debug(f"WebSocket disconnected by client: {user_id} on image {image_id}")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
         try:
@@ -219,11 +264,19 @@ async def handle_websocket_connection(websocket: WebSocket, user_id: str, image_
         await connection_manager.disconnect(user_id, websocket, image_id)
 
 
-async def handle_draw_message(websocket: WebSocket, user_id: str, image_id: str, message: dict):
+async def handle_draw_message(
+    websocket: WebSocket,
+    user_id: str,
+    image_id: str,
+    message: dict,
+    recovery_event: Optional[asyncio.Event] = None,
+):
     """
     Handler para mensagem de desenho
     """
     try:
+        pixel_config = await get_user_pixel_config(user_id)
+        pixels_max = pixel_config["pixelsMax"]
         x = message.get("x")
         y = message.get("y")
         color = message.get("color")
@@ -279,9 +332,14 @@ async def handle_draw_message(websocket: WebSocket, user_id: str, image_id: str,
         response_msg = {
             "type": "draw_response",
             "success": True,
-            "pixelsRemaining": pixels_remaining
+            "pixelsRemaining": pixels_remaining,
+            "pixelsMax": pixels_max,
+            "secondsUntilNextPixel": settings.PIXEL_RECOVERY_INTERVAL,
         }
         await connection_manager.send_personal(websocket, response_msg)
+
+        if recovery_event:
+            recovery_event.set()
         
         logger.debug(f"{user_id} drew pixel at ({x},{y}), {pixels_remaining} remaining")
     
@@ -298,9 +356,17 @@ async def handle_draw_message(websocket: WebSocket, user_id: str, image_id: str,
             pass
 
 
-async def handle_draw_batch(websocket: WebSocket, user_id: str, image_id: str, message: dict):
+async def handle_draw_batch(
+    websocket: WebSocket,
+    user_id: str,
+    image_id: str,
+    message: dict,
+    recovery_event: Optional[asyncio.Event] = None,
+):
     """Handler para mensagem de desenho em lote"""
     draws = message.get("draws")
+    pixel_config = await get_user_pixel_config(user_id)
+    pixels_max = pixel_config["pixelsMax"]
 
     if not isinstance(draws, list):
         await connection_manager.send_personal(websocket, {
@@ -309,53 +375,97 @@ async def handle_draw_batch(websocket: WebSocket, user_id: str, image_id: str, m
             "processed": 0,
             "failed": 0,
             "pixelsRemaining": redis_service.get_pixels(user_id),
+            "pixelsMax": pixels_max,
+            "secondsUntilNextPixel": 0,
             "error": "invalid_draw_batch"
         })
         return
 
-    processed = 0
-    failed = 0
-    pixels_remaining = redis_service.get_pixels(user_id)
+    normalized_draws = []
 
     for draw in draws:
         if not all([draw.get("x") is not None, draw.get("y") is not None, draw.get("color"), draw.get("tool")]):
-            failed += 1
-            continue
+            await connection_manager.send_personal(websocket, {
+                "type": MessageType.DRAW_BATCH_RESPONSE,
+                "success": False,
+                "processed": 0,
+                "failed": len(draws),
+                "pixelsRemaining": redis_service.get_pixels(user_id),
+                "pixelsMax": pixels_max,
+                "secondsUntilNextPixel": 0,
+                "error": "invalid_draw_batch"
+            })
+            return
 
-        success, pixels_remaining, result = redis_service.draw_pixel(
-            image_id=image_id,
-            user_id=user_id,
-            x=int(draw.get("x")),
-            y=int(draw.get("y")),
-            color=str(draw.get("color")),
-            tool=str(draw.get("tool")),
-            timestamp=int(draw.get("timestamp", int(datetime.utcnow().timestamp() * 1000)))
-        )
-
-        if success == 0:
-            failed += 1
-            continue
-
-        processed += 1
-        broadcast_msg = {
-            "type": MessageType.DRAW,
-            "userId": user_id,
-            "imageId": image_id,
+        normalized_draws.append({
             "x": int(draw.get("x")),
             "y": int(draw.get("y")),
             "color": str(draw.get("color")),
             "tool": str(draw.get("tool")),
-            "timestamp": int(draw.get("timestamp", int(datetime.utcnow().timestamp() * 1000)))
+            "timestamp": int(draw.get("timestamp", int(datetime.utcnow().timestamp() * 1000))),
+        })
+
+    pixels_remaining = redis_service.get_pixels(user_id)
+
+    if pixels_remaining <= 0 or len(normalized_draws) > pixels_remaining:
+        await connection_manager.send_personal(websocket, {
+            "type": MessageType.DRAW_BATCH_RESPONSE,
+            "success": False,
+            "processed": 0,
+            "failed": len(normalized_draws),
+            "pixelsRemaining": pixels_remaining,
+            "pixelsMax": pixels_max,
+            "secondsUntilNextPixel": 0,
+            "error": "out_of_pixels"
+        })
+        return
+
+    submitted_at = int(datetime.utcnow().timestamp())
+    success, pixels_remaining, error_code = redis_service.draw_batch(
+        image_id=image_id,
+        user_id=user_id,
+        draws=normalized_draws,
+        submitted_at=submitted_at,
+    )
+
+    if success == 0:
+        await connection_manager.send_personal(websocket, {
+            "type": MessageType.DRAW_BATCH_RESPONSE,
+            "success": False,
+            "processed": 0,
+            "failed": len(normalized_draws),
+            "pixelsRemaining": pixels_remaining,
+            "pixelsMax": pixels_max,
+            "secondsUntilNextPixel": 0,
+            "error": error_code or "invalid_draw_batch",
+        })
+        return
+
+    for draw in normalized_draws:
+        broadcast_msg = {
+            "type": MessageType.DRAW,
+            "userId": user_id,
+            "imageId": image_id,
+            "x": draw["x"],
+            "y": draw["y"],
+            "color": draw["color"],
+            "tool": draw["tool"],
+            "timestamp": draw["timestamp"],
         }
         await connection_manager.broadcast(image_id, broadcast_msg)
 
     response_msg = {
         "type": MessageType.DRAW_BATCH_RESPONSE,
-        "success": failed == 0,
-        "processed": processed,
-        "failed": failed,
+        "success": True,
+        "processed": len(normalized_draws),
+        "failed": 0,
         "pixelsRemaining": pixels_remaining,
-        "error": None if failed == 0 else "some_failed"
+        "pixelsMax": pixels_max,
+        "secondsUntilNextPixel": settings.PIXEL_RECOVERY_INTERVAL if pixels_remaining < pixels_max else 0,
+        "error": None,
     }
     await connection_manager.send_personal(websocket, response_msg)
+
+    if recovery_event:
+        recovery_event.set()
 

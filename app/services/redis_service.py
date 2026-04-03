@@ -2,10 +2,14 @@
 Redis Service - Operações com Redis
 """
 import redis
-import json
 from typing import Optional, Dict, List
 from app.core.config import settings
-from app.utils.lua_scripts import DRAW_PIXEL_SCRIPT, RECOVER_PIXELS_SCRIPT, INIT_USER_SCRIPT
+from app.utils.lua_scripts import (
+    DRAW_PIXEL_SCRIPT,
+    DRAW_BATCH_SCRIPT,
+    RECOVER_PIXELS_SCRIPT,
+    INIT_USER_SCRIPT,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -22,6 +26,7 @@ class RedisService:
         
         # Registra Lua scripts
         self.draw_pixel_sha = self.redis_client.script_load(DRAW_PIXEL_SCRIPT)
+        self.draw_batch_sha = self.redis_client.script_load(DRAW_BATCH_SCRIPT)
         self.recover_pixels_sha = self.redis_client.script_load(RECOVER_PIXELS_SCRIPT)
         self.init_user_sha = self.redis_client.script_load(INIT_USER_SCRIPT)
 
@@ -82,10 +87,10 @@ class RedisService:
             raise
 
     def recover_pixels(self, user_id: str, pixels_max: int, current_time: int, 
-                      recovery_interval: int) -> tuple[int, int]:
+                      recovery_interval: int) -> tuple[int, int, int]:
         """
         Recupera pixels baseado em tempo decorrido
-        Retorna: (total_pixels, pixels_gained)
+        Retorna: (total_pixels, pixels_gained, seconds_until_next_pixel)
         """
         try:
             result = self.redis_client.evalsha(
@@ -99,6 +104,38 @@ class RedisService:
             return tuple(result)
         except Exception as e:
             logger.error(f"Error recovering pixels: {e}")
+            raise
+
+    def draw_batch(self, image_id: str, user_id: str, draws: List[Dict[str, str]],
+                   submitted_at: int) -> tuple[int, int, Optional[str]]:
+        """
+        Persiste um lote de pixels de forma atômica
+        Retorna: (success, pixels_remaining, error_msg)
+        """
+        try:
+            args: List[str | int] = [user_id, len(draws), submitted_at]
+
+            for draw in draws:
+                args.extend([
+                    f"{draw['x']},{draw['y']}",
+                    draw["color"],
+                    draw["tool"],
+                    draw["timestamp"],
+                ])
+
+            result = self.redis_client.evalsha(
+                self.draw_batch_sha,
+                1,
+                image_id,
+                *args,
+            )
+
+            if result[0] == 0:
+                return (0, int(result[1]), result[2])
+
+            return (1, int(result[1]), None)
+        except Exception as e:
+            logger.error(f"Error drawing batch: {e}")
             raise
 
     def get_pixels(self, user_id: str) -> int:

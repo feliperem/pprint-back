@@ -45,7 +45,7 @@ NODE_TLS_REJECT_UNAUTHORIZED=0 python -m playwright install chromium
 > Em redes sem restrição SSL:
 
 ```bash
-python -m playwright install chromium
+pip install -r requirements.txt
 ```
 
 ---

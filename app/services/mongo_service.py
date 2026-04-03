@@ -64,6 +64,42 @@ class MongoService:
             logger.error(f"Error upserting user: {e}")
             return False
 
+    async def get_or_create_user_pixel_config(self, user_id: str) -> Dict[str, Any]:
+        """Obtém configuração de pixels do usuário, criando defaults quando necessário."""
+        default_pixels_max = settings.PIXELS_MAX
+
+        try:
+            users = self.db["users"]
+            now = datetime.utcnow()
+
+            await users.update_one(
+                {"_id": user_id},
+                {
+                    "$setOnInsert": {
+                        "createdAt": now,
+                        "pixelsMax": default_pixels_max,
+                    },
+                    "$set": {
+                        "updatedAt": now,
+                    },
+                },
+                upsert=True,
+            )
+
+            user = await users.find_one({"_id": user_id}, {"pixelsMax": 1})
+            pixels_max = int((user or {}).get("pixelsMax", default_pixels_max))
+
+            return {
+                "userId": user_id,
+                "pixelsMax": pixels_max,
+            }
+        except Exception as e:
+            logger.error(f"Error getting pixel config for {user_id}: {e}")
+            return {
+                "userId": user_id,
+                "pixelsMax": default_pixels_max,
+            }
+
     async def insert_pixel(self, pixel_data: Dict[str, Any]) -> Optional[str]:
         """Insere um pixel no histórico"""
         try:
